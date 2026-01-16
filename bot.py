@@ -2,19 +2,20 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-import pandas as pd
 
+import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BASE_DIR = Path(__file__).resolve().parent
 
-def env_set(name: str) -> bool:
-    v = os.getenv(name)
-    return bool(v and v.strip())
+
+def env(name: str) -> str:
+    return (os.getenv(name) or "").strip()
+
 
 def parse_allowed_chat_ids() -> set[int]:
-    raw = (os.getenv("ALLOWED_CHAT_IDS") or "").strip()
+    raw = env("ALLOWED_CHAT_IDS")
     if not raw:
         return set()  # пусто = разрешены все (для демо)
     ids = set()
@@ -24,26 +25,15 @@ def parse_allowed_chat_ids() -> set[int]:
             ids.add(int(part))
     return ids
 
+
 ALLOWED_CHAT_IDS = parse_allowed_chat_ids()
+
 
 def is_allowed(chat_id: int) -> bool:
     return (not ALLOWED_CHAT_IDS) or (chat_id in ALLOWED_CHAT_IDS)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
-        return
-    if not is_allowed(update.effective_chat.id):
-        await update.message.reply_text("Сорри, этот бот не для этого чата 🙂")
-        return
-
-    await update.message.reply_text(
-        "Привет! Я могу собрать отчёт из monday.\n\n"
-        "Команды:\n"
-        "/report — собрать и прислать summary_by_geo.csv\n"
-    )
 
 def run_report() -> tuple[Path, Path]:
-    # Запускаем report.py тем же Python, которым запущен бот
     proc = subprocess.run(
         [sys.executable, str(BASE_DIR / "report.py")],
         cwd=str(BASE_DIR),
@@ -52,14 +42,13 @@ def run_report() -> tuple[Path, Path]:
         timeout=180,
     )
 
-    # Логи пригодятся, если что-то упадёт
     (BASE_DIR / "last_report_stdout.txt").write_text(proc.stdout or "", encoding="utf-8")
     (BASE_DIR / "last_report_stderr.txt").write_text(proc.stderr or "", encoding="utf-8")
 
     if proc.returncode != 0:
         raise RuntimeError(
             "report.py завершился с ошибкой.\n\n"
-            f"STDERR:\n{proc.stderr[-1500:]}"
+            f"STDERR:\n{(proc.stderr or '')[-1500:]}"
         )
 
     summary_path = BASE_DIR / "summary_by_geo.csv"
@@ -71,19 +60,43 @@ def run_report() -> tuple[Path, Path]:
 
     return summary_path, raw_path
 
+
 def preview_summary(summary_csv: Path) -> str:
     try:
         df = pd.read_csv(summary_csv)
         if df.empty:
-            return "Сводка пустая (0 строк). Возможно, всё отфильтровано или нет подходящих статусов."
-        # оставим топ-20, чтобы не спамить
-        df = df.sort_values("Итого", ascending=False).head(20)
+            return "Сводка пустая (0 строк)."
+        # если есть Итого — сортируем по нему, иначе по Обучаются
+        sort_col = "Итого" if "Итого" in df.columns else ("Обучаются" if "Обучаются" in df.columns else None)
+        if sort_col:
+            df = df.sort_values(sort_col, ascending=False)
+        df = df.head(20)
+
         lines = ["Сводка (топ 20):"]
         for _, r in df.iterrows():
-            lines.append(f"- {r['geo']}: обучаются {int(r.get('Обучаются',0))}, ожидают {int(r.get('Ожидают',0))}, итого {int(r.get('Итого',0))}")
+            geo = r.get("geo", "")
+            обуч = int(r.get("Обучаются", 0))
+            ожид = int(r.get("Ожидают", 0))
+            итого = int(r.get("Итого", обуч + ожид))
+            lines.append(f"- {geo}: обучаются {обуч}, ожидают {ожид}, итого {итого}")
         return "\n".join(lines)
     except Exception:
-        return "Сводку прочитать не смог (но CSV файл сейчас пришлю)."
+        return "CSV сформирован — сейчас пришлю файлом."
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None:
+        return
+    if not is_allowed(update.effective_chat.id):
+        await update.message.reply_text("Сорри, этот бот не для этого чата 🙂")
+        return
+
+    await update.message.reply_text(
+        "Привет! Я собираю отчёт из monday.\n\n"
+        "Команды:\n"
+        "/report — собрать и прислать summary_by_geo.csv\n"
+    )
+
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None:
@@ -92,13 +105,9 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Сорри, этот бот не для этого чата 🙂")
         return
 
-    # быстрая проверка, что токены заданы
-    missing = []
-    for v in ["MONDAY_API_TOKEN", "TELEGRAM_BOT_TOKEN"]:
-        if not env_set(v):
-            missing.append(v)
-    if missing:
-        await update.message.reply_text(f"Не заданы переменные окружения: {', '.join(missing)}")
+    # Проверка токенов
+    if not env("MONDAY_API_TOKEN"):
+        await update.message.reply_text("Не задан MONDAY_API_TOKEN в переменных окружения.")
         return
 
     msg = await update.message.reply_text("Собираю отчёт…")
@@ -106,7 +115,6 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         summary_csv, raw_csv = run_report()
 
-        # небольшой текст + файлы
         await msg.edit_text(preview_summary(summary_csv))
 
         await update.message.reply_document(
@@ -122,7 +130,6 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     except Exception as e:
-        # если что — кидаем ошибку и логи
         await msg.edit_text(f"Упало 😬\n\n{e}")
 
         stderr_path = BASE_DIR / "last_report_stderr.txt"
@@ -132,15 +139,44 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if stdout_path.exists():
             await update.message.reply_document(stdout_path.read_bytes(), filename="last_report_stdout.txt")
 
-def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError('Не найден TELEGRAM_BOT_TOKEN. Задай переменную окружения.')
 
-    app = Application.builder().token(token).build()
+def main():
+    tg_token = env("TELEGRAM_BOT_TOKEN")
+    if not tg_token:
+        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
+
+    app = Application.builder().token(tg_token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("report", report))
+
+    # --- Режим Koyeb / Webhook ---
+    webhook_base_url = env("WEBHOOK_BASE_URL")  # например: https://your-app.koyeb.app
+    webhook_secret = env("WEBHOOK_SECRET")      # например: supersecret123
+    port = int(env("PORT") or "8000")
+
+    if webhook_base_url and webhook_secret:
+        # URL, куда Telegram будет стучаться
+        webhook_url = f"{webhook_base_url.rstrip('/')}/{webhook_secret}"
+        # Путь на нашем сервере
+        url_path = webhook_secret
+
+        print("Запуск в режиме WEBHOOK")
+        print("Webhook URL:", webhook_url)
+
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+        )
+        return
+
+    # --- Локальный режим (на твоём Маке), если нужно ---
+    # На Koyeb так делать не надо.
+    print("WEBHOOK переменные не заданы — запускаю polling (только для локального теста).")
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
